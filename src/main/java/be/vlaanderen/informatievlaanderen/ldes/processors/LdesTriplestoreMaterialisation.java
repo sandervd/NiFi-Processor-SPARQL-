@@ -14,15 +14,14 @@ import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.io.InputStreamCallback;
 import org.apache.nifi.processor.io.OutputStreamCallback;
-import org.eclipse.rdf4j.common.exception.RDF4JException;
-import org.eclipse.rdf4j.model.IRI;
+import org.eclipse.rdf4j.model.*;
+import org.eclipse.rdf4j.model.base.AbstractIRI;
 import org.eclipse.rdf4j.repository.Repository;
 import org.eclipse.rdf4j.repository.RepositoryConnection;
 import org.eclipse.rdf4j.repository.manager.RemoteRepositoryManager;
 import org.eclipse.rdf4j.repository.manager.RepositoryManager;
 import org.eclipse.rdf4j.rio.RDFFormat;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.eclipse.rdf4j.rio.Rio;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -35,9 +34,6 @@ import org.apache.nifi.processor.util.StandardValidators;
 @CapabilityDescription("Materialises LDES events in a triplestore (SPARQL query)")
 @InputRequirement(InputRequirement.Requirement.INPUT_REQUIRED)
 public class LdesTriplestoreMaterialisation extends AbstractProcessor {
-
-	private static final Logger LOGGER = LoggerFactory.getLogger(LdesTriplestoreMaterialisation.class);
-
 	private RepositoryManager repositoryManager;
 
 	static final Relationship REL_SUCCESS = new Relationship.Builder()
@@ -97,27 +93,27 @@ public class LdesTriplestoreMaterialisation extends AbstractProcessor {
 			public void process(InputStream in) throws IOException {
 					String FragmentRDF = IOUtils.toString(in);
 					getLogger().debug(String.format("Got the following RDF: %s", FragmentRDF));
+					InputStream targetStream = IOUtils.toInputStream(FragmentRDF);
+					Model updateModel = Rio.parse(targetStream, "", RDFFormat.TURTLE);
+
+					Set<Resource> entityIds = getSubjectsFromModel(updateModel);
+
 					Repository repository = repositoryManager.getRepository(context.getProperty(REPOSITORY_ID).getValue());
-					String namedGraph = context.getProperty(NAMED_GRAPH).getValue();
-
-					try (RepositoryConnection con = repository.getConnection()) {
-
-						InputStream targetStream = IOUtils.toInputStream(FragmentRDF);
-						con.begin();
-						if (namedGraph.isEmpty()) {
-							con.add(targetStream, RDFFormat.N3);
-						}
-						else {
-							IRI namedGraphIRI = con.getValueFactory().createIRI(namedGraph);
-							con.add(targetStream, RDFFormat.N3, namedGraphIRI);
-						}
+					try (RepositoryConnection dbConnection = repository.getConnection()) {
 
 
-						con.commit();
-					}
-					catch (RDF4JException e) {
-						getLogger().error(e.getMessage());
-						getLogger().error(e.getStackTrace().toString());
+						// Start a transaction to avoid autocommit.
+						dbConnection.begin();
+
+						// Delete the old version of the entity from the db.
+						deleteEntitiesFromRepo(entityIds, dbConnection);
+
+						// Save the new data to the DB.
+						String namedGraph = context.getProperty(NAMED_GRAPH).getValue();
+						IRI namedGraphIRI = dbConnection.getValueFactory().createIRI(namedGraph);
+						dbConnection.add(updateModel, namedGraphIRI);
+
+						dbConnection.commit();
 					}
 			}
 		});
@@ -132,6 +128,46 @@ public class LdesTriplestoreMaterialisation extends AbstractProcessor {
 		});
 
 		session.transfer(flowfile, REL_SUCCESS);
+	}
+
+	/**
+	 * Returns all subjects ('real' URIs) present in the model.
+	 * @param model A graph
+	 * @return A set of subject URIs.
+	 */
+	private static Set<Resource> getSubjectsFromModel(Model model) {
+		Set<Resource> entityIds = new HashSet<>();
+		model.subjects().forEach((Resource subject) -> {
+			if (subject instanceof AbstractIRI) {
+				entityIds.add(subject);
+			}
+		});
+		return entityIds;
+	}
+
+	/**
+	 * Delete an entity, including its blank nodes, from a repository.
+	 * @param entityIds The subjects of the entities to delete.
+	 * @param connection The DB connection.
+	 */
+	private static void deleteEntitiesFromRepo(Set<Resource> entityIds, RepositoryConnection connection) {
+		Stack<Resource> subjectStack = new Stack<>();
+		entityIds.forEach(subjectStack::push);
+		/*
+		 * Entities can contain blank node references. All statements with those blank node identifiers
+		 * need to be removed as well. As blank nodes can be nested inside blank nodes, we need to keep track of them
+		 * as they are encountered by adding them to the stack.
+		 */
+		while (!subjectStack.isEmpty()) {
+			Resource subject = subjectStack.pop();
+			connection.getStatements(subject, null, null).forEach((Statement statement) -> {
+				Value object = statement.getObject();
+				if (object.isBNode()) {
+					subjectStack.push((Resource) object);
+				}
+			});
+			connection.remove(subject, null, null);
+		}
 	}
 	@Override
 	public Set<Relationship> getRelationships() {
