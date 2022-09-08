@@ -13,7 +13,7 @@ import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.io.InputStreamCallback;
-import org.apache.nifi.processor.io.OutputStreamCallback;
+import org.eclipse.rdf4j.common.transaction.IsolationLevels;
 import org.eclipse.rdf4j.model.*;
 import org.eclipse.rdf4j.model.base.AbstractIRI;
 import org.eclipse.rdf4j.repository.Repository;
@@ -25,8 +25,8 @@ import org.eclipse.rdf4j.rio.Rio;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.nifi.processor.util.StandardValidators;
 
@@ -39,10 +39,6 @@ public class LdesTriplestoreMaterialisation extends AbstractProcessor {
 	static final Relationship REL_SUCCESS = new Relationship.Builder()
 			.name("success")
 			.description("A FlowFile is routed to this relationship after the database is successfully updated")
-			.build();
-	static final Relationship REL_RETRY = new Relationship.Builder()
-			.name("retry")
-			.description("A FlowFile is routed to this relationship if the database cannot be updated but attempting the operation again may succeed")
 			.build();
 	static final Relationship REL_FAILURE = new Relationship.Builder()
 			.name("failure")
@@ -80,54 +76,53 @@ public class LdesTriplestoreMaterialisation extends AbstractProcessor {
 
 	@Override
 	public void onTrigger(ProcessContext context, ProcessSession session) throws ProcessException {
-		FlowFile flowfile = session.get();
+		// @todo Find out the ideal number of FlowFiles to process in one transaction.
+		final List<FlowFile> flowFiles = session.get(50);
 
-		if(flowfile == null) {
-			context.yield();
+		Repository repository = repositoryManager.getRepository(context.getProperty(REPOSITORY_ID).getValue());
+		if (flowFiles.isEmpty()) {
 			return;
 		}
+		final AtomicBoolean committed = new AtomicBoolean(false);
+		try (RepositoryConnection dbConnection = repository.getConnection()) {
+			// As we are bulk-loading, set isolation level to none for improved performance.
+			dbConnection.setIsolationLevel(IsolationLevels.NONE);
+			dbConnection.begin();
 
-		session.read(flowfile, new InputStreamCallback() {
+			for (FlowFile flowFile : flowFiles) {
+				session.read(flowFile, new InputStreamCallback() {
+					@Override
+					public void process(InputStream in) throws IOException {
+						String LDESMemberRDF = IOUtils.toString(in);
+						InputStream targetStream = IOUtils.toInputStream(LDESMemberRDF);
+						Model updateModel = Rio.parse(targetStream, "", RDFFormat.NQUADS);
 
-			@Override
-			public void process(InputStream in) throws IOException {
-					String FragmentRDF = IOUtils.toString(in);
-					getLogger().debug(String.format("Got the following RDF: %s", FragmentRDF));
-					InputStream targetStream = IOUtils.toInputStream(FragmentRDF);
-					Model updateModel = Rio.parse(targetStream, "", RDFFormat.TURTLE);
+						Set<Resource> entityIds = getSubjectsFromModel(updateModel);
 
-					Set<Resource> entityIds = getSubjectsFromModel(updateModel);
-
-					Repository repository = repositoryManager.getRepository(context.getProperty(REPOSITORY_ID).getValue());
-					try (RepositoryConnection dbConnection = repository.getConnection()) {
-
-
-						// Start a transaction to avoid autocommit.
-						dbConnection.begin();
-
-						// Delete the old version of the entity from the db.
+						// Delete the old version of the entity (ldes member) from the db.
 						deleteEntitiesFromRepo(entityIds, dbConnection);
 
 						// Save the new data to the DB.
 						String namedGraph = context.getProperty(NAMED_GRAPH).getValue();
-						IRI namedGraphIRI = dbConnection.getValueFactory().createIRI(namedGraph);
-						dbConnection.add(updateModel, namedGraphIRI);
+						if (!namedGraph.isEmpty()) {
+							IRI namedGraphIRI = dbConnection.getValueFactory().createIRI(namedGraph);
+							dbConnection.add(updateModel, namedGraphIRI);
+						} else
+							dbConnection.add(updateModel);
 
-						dbConnection.commit();
 					}
+				});
 			}
-		});
-
-		// To write the results back out ot flow file
-		flowfile = session.write(flowfile, new OutputStreamCallback() {
-
-			@Override
-			public void process(OutputStream out) throws IOException {
-				//out.write(value.get().getBytes());
-			}
-		});
-
-		session.transfer(flowfile, REL_SUCCESS);
+			dbConnection.commit();
+			committed.set(true);
+		}
+		for (FlowFile flowFile : flowFiles) {
+			if (committed.get())
+				session.transfer(flowFile, REL_SUCCESS);
+			else
+				session.transfer(flowFile, REL_FAILURE);
+		}
+		session.commit();
 	}
 
 	/**
@@ -171,11 +166,10 @@ public class LdesTriplestoreMaterialisation extends AbstractProcessor {
 	}
 	@Override
 	public Set<Relationship> getRelationships() {
-		final Set<Relationship> rels = new HashSet<>();
-		rels.add(REL_SUCCESS);
-		rels.add(REL_RETRY);
-		rels.add(REL_FAILURE);
-		return rels;
+		final Set<Relationship> relationships = new HashSet<>();
+		relationships.add(REL_SUCCESS);
+		relationships.add(REL_FAILURE);
+		return relationships;
 	}
 
 	@Override
